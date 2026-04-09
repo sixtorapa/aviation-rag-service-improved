@@ -1,0 +1,11 @@
+@"
+.env
+data/
+vector_store/
+__pycache__/
+services/__pycache__/
+*.pyc
+*.pkl
+Old/
+Documentacion.docx
+"@ | Out-File -FilePath .gitignore -Encoding utf8

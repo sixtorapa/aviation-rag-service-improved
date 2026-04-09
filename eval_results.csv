@@ -1,0 +1,6 @@
+metric,score
+retrieval_precision,1.0
+retrieval_recall,1.0
+retrieval_f1,1.0
+faithfulness,0.95
+answer_relevancy,0.747
