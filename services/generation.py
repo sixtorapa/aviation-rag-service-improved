@@ -1,58 +1,20 @@
 """
-improvements/generation_json.py
-================================
-Improvement over services/generation.py: structured JSON output + citation validation.
+services/generation.py
 
-PROBLEM WITH CURRENT generation.py
-------------------------------------
-The current system instructs the LLM to append a PAGES_USED line:
+Generates grounded answers via Gemini and extracts evidence-based citations.
 
-    PAGES_USED: Boeing B737 Manual.pdf:15,16|BCN-FCO Menus.pdf:3
+Key design: the LLM is asked to report which specific pages it used.
+This separates "pages for context" (expanded neighbours) from
+"pages for citing" (only those that actually supported the answer).
 
-This is then parsed with string manipulation using rfind(":") and split("|").
-Two failure modes exist:
-
-1. FORMAT DRIFT: If the LLM does not follow the exact format (missing colon,
-   extra spaces, different separator), the parser silently returns empty citations.
-   This happens more often as models are upgraded or prompts evolve.
-
-2. HALLUCINATED PAGES: The LLM might cite a page number that was not in the
-   retrieved context — page 999 of a 70-page document. The current parser
-   accepts any integer without validation.
-
-SOLUTION
---------
-Replace PAGES_USED with structured JSON output. The LLM returns its entire
-response as a JSON object:
-
-    {
-      "answer": "The fuel required is 7.2 (1000 KG) and the time is 3:27.",
-      "references": [
-        {"document_title": "Boeing B737 Manual.pdf", "pages": [15]}
-      ]
-    }
-
-A validation layer then cross-checks every cited page against the set of pages
-that were actually present in the retrieval context. Pages that were not
-retrieved cannot be cited — this eliminates hallucinated citations entirely.
-
-WHAT CHANGES
-------------
-- SYSTEM_PROMPT: PAGES_USED instruction replaced with JSON schema instruction
-- _parse_pages_used() replaced with _parse_json_response(raw, context_docs)
-- generate_answer() passes context_docs to the parser for validation
-
-WHAT STAYS THE SAME
--------------------
-- LLM model and temperature
-- All other system prompt rules (grounding, conciseness, no preamble)
-- Return type: Tuple[str, List[Dict]]
+The spec penalises non-relevant pages in references — so citations
+must reflect evidence, not retrieval artefacts.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Dict, List, Set, Tuple
+import re
+from typing import Dict, List, Tuple
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.messages import HumanMessage, SystemMessage
@@ -64,6 +26,34 @@ from services.retrieval import build_context
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
+# SYSTEM_PROMPT = """You are an expert aviation information assistant with access to:
+# - Boeing 737 Operations Manual (performance data, procedures, systems)
+# - Airbus A320/A321 Flight Crew Training Manual (normal operations)
+# - In-flight menus for routes BCN-FCO and VIE-LHR (food options, allergens)
+
+# STRICT RULES:
+# 1. Answer ONLY using the provided context. If not found, say:
+#    "I could not find this information in the available documents."
+# 2. Never fill gaps with training knowledge. Reproduce exact numbers — never approximate.
+# 3. For allergen/menu data, be precise — passengers may have serious dietary requirements.
+# 4. Keep answers concise and structured.
+
+# CITATION FORMAT — this is mandatory:
+# After your answer, on a new line write exactly:
+# PAGES_USED: <document_title_1>:<page1>,<page2>|<document_title_2>:<page3>
+
+# Rules for PAGES_USED:
+# - Only include pages where the specific evidence for your answer appears.
+# - Do NOT include pages you read for context but did not use.
+# - If a number, procedure, or fact came from a page, cite it. If not, omit it.
+# - Use the exact document titles as they appear in [Source: ...] tags.
+# - If answer spans multiple documents, separate with |
+
+# Example:
+# PAGES_USED: Boeing B737 Manual.pdf:15,16|BCN-FCO Menus.pdf:3
+# """
+
+
 SYSTEM_PROMPT = """You are an expert aviation information assistant with access to:
 - Boeing 737 Operations Manual (performance data, procedures, systems)
 - Airbus A320/A321 Flight Crew Training Manual (normal operations)
@@ -74,40 +64,47 @@ STRICT RULES:
    "I could not find this information in the available documents."
 2. Never fill gaps with training knowledge. Reproduce exact numbers — never approximate.
 3. For allergen/menu data, be precise — passengers may have serious dietary requirements.
-4. Be concise and direct, but adapt the level of detail to the question:
-   - For simple factual questions (e.g. menu options, allergens, single values),
-     provide a short, direct answer.
-   - For procedural or multi-part questions (e.g. steps, components, conditions),
-     include all necessary steps or elements clearly.
+4. Use a strict answer format depending on the question type:
 
-5. Answer ONLY the specific thing asked, but include all essential supporting
-   details required for correctness (e.g. values, conditions, thresholds).
-   Do not include unrelated information.
+- If the answer is a list of options, steps, or procedures:
+  Return a bullet list with one item per line.
 
-6. When the answer contains multiple items (e.g. procedures, components),
-   structure it clearly using bullet points or short paragraphs.
+- If the answer is a single fact (value, name, option, role):
+  Return a single sentence with only that fact.
 
-OUTPUT FORMAT — mandatory, no exceptions:
-Return a single valid JSON object with exactly this structure:
+- If the answer compares items:
+  Return one line per item, clearly labeled.
 
-{
-  "answer": "<your answer here>",
-  "references": [
-    {
-      "document_title": "<exact filename from [Source: ...] tags>",
-      "pages": [<integer page numbers where the evidence appears>]
-    }
-  ]
-}
+Do not mix formats. Do not add explanations unless strictly necessary.
+5. Answer ONLY the specific thing asked in the question.
+6. Do NOT describe unrelated parts of a diagram, table, procedure, or page.
+7. If the question asks about one step, one item, one role, one page element, or one value, return only that specific step, item, role, page element, or value.
+8. If multiple roles, areas, or sides appear in the context, select ONLY the one directly associated with the specific item asked about.
+9. Prefer direct factual answers over broad summaries.
+10. Start your answer immediately with the factual content. \
+Never begin with phrases like "Based on the context", "According to the document", \
+"The document states", or any preamble. Go straight to the answer.
+11. Do NOT include any additional information beyond what is strictly required 
+to answer the question. Extra details, even if correct, will be considered incorrect.
+12. When multiple items are expected, label them clearly 
+(e.g., "Primary Procedure:", "Alternate Procedure:").
+13. Never combine paragraph explanations with lists or labeled items.
+The output must strictly follow one format only.
+14. The PAGES_USED line is mandatory. If missing or malformed, the answer is invalid.
 
-Rules for references:
-- Only include pages where specific evidence for your answer appears.
-- Do NOT include pages you read for context but did not use as evidence.
-- Use the exact document title as it appears in the [Source: ...] tags.
-- If evidence spans multiple documents, include one object per document.
-- If no specific page contains the evidence, return an empty references array.
+CITATION FORMAT — this is mandatory:
+After your answer, on a new line write exactly:
+PAGES_USED: <document_title_1>:<page1>,<page2>|<document_title_2>:<page3>
 
-Return JSON only. No markdown fences. No text before or after the JSON object.
+Rules for PAGES_USED:
+- Only include pages where the specific evidence for your answer appears.
+- Do NOT include pages you read for context but did not use.
+- If a number, procedure, or fact came from a page, cite it. If not, omit it.
+- Use the exact document titles as they appear in [Source: ...] tags.
+- If answer spans multiple documents, separate with |
+
+Example:
+PAGES_USED: Boeing B737 Manual.pdf:15,16|BCN-FCO Menus.pdf:3
 """
 
 
@@ -122,89 +119,67 @@ def _get_llm() -> ChatGoogleGenerativeAI:
     )
 
 
-# ── Allowed pages index ───────────────────────────────────────────────────────
+# ── Citation parser ───────────────────────────────────────────────────────────
 
-def _build_allowed_pages(context_docs: List[Document]) -> Dict[str, Set[int]]:
+def _parse_pages_used(raw_response: str) -> Tuple[str, List[Dict]]:
     """
-    Build a lookup of {document_title: {page_numbers}} from the retrieved context.
-
-    This is the validation allowlist — only pages that were actually retrieved
-    can appear in the final citations. If the LLM cites a page that was not
-    in the context, it is silently discarded.
-
-    Why this matters: LLMs can occasionally hallucinate page numbers, especially
-    when the context contains many source labels. Cross-referencing against the
-    actual retrieved pages eliminates this failure mode entirely.
-    """
-    allowed: Dict[str, Set[int]] = {}
-    for doc in context_docs:
-        title = doc.metadata.get("document_title", "")
-        page = doc.metadata.get("page_number")
-        if title and isinstance(page, int):
-            allowed.setdefault(title, set()).add(page)
-    return allowed
-
-
-# ── JSON response parser ──────────────────────────────────────────────────────
-
-def _parse_json_response(
-    raw_response: str,
-    context_docs: List[Document],
-) -> Tuple[str, List[Dict]]:
-    """
-    Parse the LLM's JSON response and validate citations against the context.
+    Extract PAGES_USED from the LLM response and build citation objects.
 
     Returns:
-        answer:     The answer text extracted from the JSON.
-        citations:  Validated list of { document_title, pages } dicts.
-                    Pages not present in the retrieved context are discarded.
-
-    Graceful degradation:
-        If the LLM returns malformed JSON, the raw text is returned as the
-        answer with empty citations rather than raising an exception.
+        answer:    The answer text (without the PAGES_USED line)
+        citations: List of { document_title, pages } dicts
     """
-    allowed_pages = _build_allowed_pages(context_docs)
+    # Split answer from pages line
+    lines = raw_response.strip().split("\n")
+    pages_line = ""
+    answer_lines = []
 
-    # Strip markdown fences if the LLM wraps output despite instructions
-    clean = raw_response.strip()
-    if clean.startswith("```"):
-        lines = clean.split("\n")
-        clean = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+    for line in lines:
+        if line.strip().startswith("PAGES_USED:"):
+            pages_line = line.strip()
+        else:
+            answer_lines.append(line)
 
+    answer = "\n".join(answer_lines).strip()
+
+    if not pages_line:
+        # LLM didn't follow format — return empty citations
+        print("  ⚠ No PAGES_USED line found in response")
+        return answer, []
+
+    # Parse: PAGES_USED: Doc1.pdf:1,2|Doc2.pdf:3
+    citations = []
     try:
-        data = json.loads(clean)
-    except json.JSONDecodeError as e:
-        print(f"  ⚠ JSON parse failed: {e}. Returning raw text.")
-        return raw_response.strip(), []
+        raw = pages_line.replace("PAGES_USED:", "").strip()
+        doc_blocks = raw.split("|")
 
-    answer = str(data.get("answer", "")).strip()
-    raw_refs = data.get("references", [])
+        for block in doc_blocks:
+            block = block.strip()
+            if ":" not in block:
+                continue
+            # Split on last colon to handle filenames with colons
+            last_colon = block.rfind(":")
+            title = block[:last_colon].strip()
+            pages_str = block[last_colon + 1:].strip()
 
-    validated_refs: List[Dict] = []
+            pages = []
+            for p in pages_str.split(","):
+                p = p.strip()
+                if p.isdigit():
+                    pages.append(int(p))
 
-    for ref in raw_refs:
-        title = str(ref.get("document_title", "")).strip()
-        pages_raw = ref.get("pages", [])
+            if title and pages:
+                citations.append({
+                    "document_title": title,
+                    "pages": sorted(pages),
+                })
 
-        # Validate each page: must be an integer present in the allowed set
-        clean_pages = sorted({
-            int(p)
-            for p in pages_raw
-            if isinstance(p, int) and p in allowed_pages.get(title, set())
-        })
+    except Exception as e:
+        print(f"  ⚠ Error parsing PAGES_USED: {e}")
+        return answer, []
 
-        if not clean_pages:
-            # LLM cited a document+pages not in the retrieved context
-            print(f"  ⚠ Citation discarded — '{title}' pages {pages_raw} not in context")
-            continue
-
-        validated_refs.append({
-            "document_title": title,
-            "pages": clean_pages,
-        })
-
-    print(f"  Validated citations: {validated_refs}")
-    return answer, validated_refs
+    print(f"  Evidence pages cited by LLM: {citations}")
+    return answer, citations
 
 
 # ── Main generation function ───────────────────────────────────────────────────
@@ -214,9 +189,11 @@ def generate_answer(
     context_docs: List[Document],
 ) -> Tuple[str, List[Dict]]:
     """
-    Generate a grounded answer with validated JSON citations.
+    Generate a grounded answer from the expanded context docs.
 
-    Identical signature to the production generate_answer() — drop-in replacement.
+    The LLM receives all expanded pages (reranked + neighbours) for
+    full comprehension, but is instructed to cite only the pages where
+    specific evidence appears.
 
     Args:
         question:     The user's question.
@@ -224,8 +201,7 @@ def generate_answer(
 
     Returns:
         answer:     Generated answer text.
-        citations:  Validated evidence-based citations (pages cross-checked
-                    against the actual retrieved context).
+        citations:  Evidence-based citations from LLM self-reporting.
     """
     if not context_docs:
         return (
@@ -235,7 +211,22 @@ def generate_answer(
 
     context = build_context(context_docs)
 
-    user_message = f"""Use the following document excerpts to answer the question.
+#     user_message = f"""Use the following document excerpts to answer the question.
+
+# --- CONTEXT START ---
+# {context}
+# --- CONTEXT END ---
+
+# Question: {question}
+
+# Remember: after your answer, include the PAGES_USED line with only the pages \
+# that contain evidence for your specific answer."""
+
+    user_message = f"""
+
+The context may contain more information than needed.
+Use ONLY the minimal subset required to answer the question.
+Ignore all unrelated content.
 
 --- CONTEXT START ---
 {context}
@@ -243,8 +234,16 @@ def generate_answer(
 
 Question: {question}
 
-Return your response as a JSON object following the schema in the system prompt.
-Only cite pages where the specific evidence for your answer appears."""
+Instructions for this answer:
+- Answer only the specific question asked.
+- Do not summarize the whole page or diagram.
+- If the question refers to one step or one item, provide only the area/value/role directly associated with that step or item.
+- Exclude unrelated roles, sides, or surrounding diagram details unless they are necessary to answer the question.
+
+- Start directly with the answer — no preamble, no restatement of the question.
+"""
+# Remember: after your answer, include the PAGES_USED line with only the pages \
+# that contain evidence for your specific answer."""
 
     llm = _get_llm()
     messages = [
@@ -255,5 +254,5 @@ Only cite pages where the specific evidence for your answer appears."""
     response = llm.invoke(messages)
     raw = (response.content or "").strip()
 
-    answer, citations = _parse_json_response(raw, context_docs)
+    answer, citations = _parse_pages_used(raw)
     return answer, citations
